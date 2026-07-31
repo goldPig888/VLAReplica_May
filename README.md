@@ -130,6 +130,43 @@ __Before the next step, ensure that:__
 
 Congrats! The environment setup is complete, and you are ready to start benchmarking your VLA models!
 
+## Training
+
+Use the unified `train.sh` script to train any of the supported policies on either a single GPU or multiple GPUs. Make it executable once:
+
+```
+chmod +x train.sh
+```
+
+The script takes two positional arguments: `./train.sh <policy> [num_gpus]`. Supported policies are `act`, `smolvla`, `pi0`, `pi0_fast`, `pi05`, `dit`, `flow_matching_dit`, and `xvla`. `num_gpus` defaults to `1`.
+
+```
+# Single GPU
+./train.sh pi0
+./train.sh act
+
+# Multi-GPU (second argument = number of GPUs; multi-GPU pi0 uses FSDP and requires fsdp_pi0.yaml in the same directory)
+./train.sh pi0 4
+CUDA_VISIBLE_DEVICES=0,1 ./train.sh smolvla 2
+
+# Optional: enable wandb logging / push checkpoints to your own HF account
+WANDB=true ./train.sh act 2
+PUSH=true HF_USER=<your_hf_username> WANDB=true ./train.sh pi05 2
+```
+
+The following optional environment variables can be set to override defaults:
+
+| Variable | Description | Default |
+| :--- | :--- | :--- |
+| `DATASET` | Dataset repo ID on the Hugging Face Hub | `HenryZhang/VLAReplica_SFT_data` |
+| `OUTPUT_BASE` | Checkpoint/output directory | `./VLAReplica_outputs` |
+| `WANDB` | Enable wandb logging (run `wandb login` first) | `false` |
+| `PUSH` | Push checkpoints to **your** HF Hub | `false` |
+| `HF_USER` | Your HF username/org for pushed repo IDs (required if `PUSH=true`) | *(none)* |
+| `FSDP_CONFIG` | Accelerate FSDP yaml for multi-GPU pi0 | `./fsdp_pi0.yaml` |
+
+> **Note:** single-GPU and multi-GPU modes keep the exact hyperparameters from the original validated scripts, so the same policy may use different settings (chunk size, batch size, steps, ...) depending on the mode.
+
 ## Evaluation script
 
 Use the evaluation script `benchmark.py` to run a policy across predefined ID or OOD tasks, with predefined reference images. Refer to the table below for all CLI flags.
