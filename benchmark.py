@@ -9,10 +9,11 @@ Usage:
         --task "pick up the object" \\
         --iterations 5
 
-Supports: act, smolvla, pi0, pi0_fast, pi05, dit, xvla
+Supports: act, smolvla, pi0, pi0_fast, pi05, dit, xvla, molmoact2
 """
 
 import argparse
+from collections import deque
 import json
 import os
 from pathlib import Path
@@ -207,7 +208,145 @@ POLICY_REGISTRY = {
         "default_path": "lerobot/x-vla",
         "default_robot_type": "so101_follower",
     },
+    "molmoact2": {
+        "default_path": "allenai/MolmoAct2-SO100_101",
+        "default_robot_type": "so101_follower",
+    },
 }
+
+
+class MolmoAct2PolicyAdapter:
+    """Direct Transformers adapter for AllenAI's SO-100/SO-101 checkpoint.
+
+    MolmoAct2 consumes two RGB images, an absolute six-joint robot state, and a
+    language instruction. It returns a chunk of absolute actions in robot scale,
+    so it intentionally bypasses LeRobot's normalized policy processors.
+    """
+
+    def __init__(
+        self,
+        model,
+        processor,
+        device: torch.device,
+        dtype: torch.dtype,
+        norm_tag: str,
+        num_steps: int,
+        actions_per_chunk: int,
+        enable_cuda_graph: bool,
+        max_joint_step_deg: float,
+        dry_run: bool,
+    ):
+        self.model = model
+        self.processor = processor
+        self.device = device
+        self.dtype = dtype
+        self.norm_tag = norm_tag
+        self.num_steps = num_steps
+        self.actions_per_chunk = actions_per_chunk
+        self.enable_cuda_graph = enable_cuda_graph
+        self.max_joint_step_deg = max_joint_step_deg
+        self.dry_run = dry_run
+        self._action_queue: deque[np.ndarray] = deque()
+
+    def reset(self) -> None:
+        self._action_queue.clear()
+
+    def _predict_chunk(self, images: list[np.ndarray], task: str, state: np.ndarray) -> None:
+        autocast_enabled = self.device.type == "cuda" and self.dtype == torch.bfloat16
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type,
+            dtype=torch.bfloat16,
+            enabled=autocast_enabled,
+        ):
+            output = self.model.predict_action(
+                processor=self.processor,
+                images=images,
+                task=task,
+                state=state,
+                norm_tag=self.norm_tag,
+                inference_action_mode="continuous",
+                enable_depth_reasoning=False,
+                num_steps=self.num_steps,
+                normalize_language=True,
+                enable_cuda_graph=self.enable_cuda_graph,
+            )
+
+        raw_actions = output.actions
+        if isinstance(raw_actions, torch.Tensor):
+            raw_actions = raw_actions.detach().float().cpu().numpy()
+        actions = np.asarray(raw_actions, dtype=np.float32)
+        if actions.ndim == 3 and actions.shape[0] == 1:
+            actions = actions[0]
+        if actions.ndim == 1:
+            actions = actions[None, :]
+        if actions.ndim != 2 or actions.shape[1] != state.shape[0]:
+            raise ValueError(
+                f"MolmoAct2 returned action shape {actions.shape}; expected (chunk, {state.shape[0]})."
+            )
+        if not np.isfinite(actions).all():
+            raise ValueError("MolmoAct2 returned NaN or infinite action values.")
+
+        count = min(self.actions_per_chunk, actions.shape[0])
+        self._action_queue.extend(actions[:count])
+
+    def predict_action(
+        self,
+        images: list[np.ndarray],
+        task: str,
+        state: np.ndarray,
+    ) -> np.ndarray:
+        if not self._action_queue:
+            self._predict_chunk(images=images, task=task, state=state)
+
+        action = self._action_queue.popleft().copy()
+        if self.max_joint_step_deg > 0:
+            max_step = float(self.max_joint_step_deg)
+            action = np.clip(action, state - max_step, state + max_step)
+        return action.astype(np.float32, copy=False)
+
+
+def load_molmoact2_policy(
+    policy_path: str,
+    device: torch.device,
+    revision: str | None,
+    dtype_name: str,
+    norm_tag: str,
+    num_steps: int,
+    actions_per_chunk: int,
+    enable_cuda_graph: bool,
+    max_joint_step_deg: float,
+    dry_run: bool,
+) -> MolmoAct2PolicyAdapter:
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    if device.type != "cuda":
+        raise RuntimeError("MolmoAct2 real-time inference requires a CUDA device.")
+
+    dtype = torch.bfloat16 if dtype_name == "bfloat16" else torch.float32
+    print(f"[INIT] Loading MolmoAct2 from {policy_path} ({dtype_name})")
+    processor = AutoProcessor.from_pretrained(
+        policy_path,
+        revision=revision,
+        trust_remote_code=True,
+    )
+    model = AutoModelForImageTextToText.from_pretrained(
+        policy_path,
+        revision=revision,
+        trust_remote_code=True,
+        dtype=dtype,
+    ).to(device).eval()
+    return MolmoAct2PolicyAdapter(
+        model=model,
+        processor=processor,
+        device=device,
+        dtype=dtype,
+        norm_tag=norm_tag,
+        num_steps=num_steps,
+        actions_per_chunk=actions_per_chunk,
+        enable_cuda_graph=enable_cuda_graph,
+        max_joint_step_deg=max_joint_step_deg,
+        dry_run=dry_run,
+    )
 
 
 def can_open_cv_preview_window() -> bool:
@@ -826,6 +965,73 @@ def extract_top_camera_image(observation: dict[str, Any]) -> np.ndarray | None:
     return candidates[0][2]
 
 
+def extract_molmoact2_inputs(
+    observation: dict[str, Any],
+    action_names: list[str],
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Extract top/wrist RGB images and raw joint state in action-name order."""
+    image_candidates: list[tuple[str, np.ndarray]] = []
+    for key, value in _iter_named_arrays(observation):
+        image = to_hwc_uint8_image(value)
+        if image is not None:
+            image_candidates.append((key.lower(), image))
+
+    if len(image_candidates) < 2:
+        raise ValueError(
+            f"MolmoAct2 requires two camera images; found {len(image_candidates)} in observation keys."
+        )
+
+    def choose_camera(tokens: tuple[str, ...], excluded: set[int]) -> int | None:
+        scored: list[tuple[int, int]] = []
+        for idx, (key, image) in enumerate(image_candidates):
+            if idx in excluded:
+                continue
+            score = sum(10 for token in tokens if token in key)
+            score += int(image.shape[0] * image.shape[1] / 100000)
+            scored.append((score, idx))
+        if not scored:
+            return None
+        scored.sort(reverse=True)
+        return scored[0][1]
+
+    top_idx = choose_camera(("top", "camera1", "front", "overhead"), set())
+    if top_idx is None:
+        raise ValueError("Could not select a top/third-person camera for MolmoAct2.")
+    wrist_idx = choose_camera(("wrist", "camera2", "side"), {top_idx})
+    if wrist_idx is None:
+        raise ValueError("Could not select a second camera for MolmoAct2.")
+
+    state_values: list[float] = []
+    missing: list[str] = []
+    for name in action_names:
+        value = observation.get(name)
+        if value is None:
+            value = observation.get(f"observation.{name}")
+        if value is None:
+            missing.append(name)
+            continue
+        arr = np.asarray(value)
+        if arr.size != 1:
+            raise ValueError(f"Joint state '{name}' must be scalar; got shape {arr.shape}.")
+        state_values.append(float(arr.reshape(-1)[0]))
+
+    if missing:
+        state_vector = observation.get("observation.state", observation.get("state"))
+        if state_vector is None:
+            raise KeyError(f"MolmoAct2 could not find joint observation keys: {missing}")
+        state = np.asarray(state_vector, dtype=np.float32).reshape(-1)
+        if state.shape[0] != len(action_names):
+            raise ValueError(
+                f"Fallback robot state has {state.shape[0]} values; expected {len(action_names)}."
+            )
+    else:
+        state = np.asarray(state_values, dtype=np.float32)
+
+    if not np.isfinite(state).all():
+        raise ValueError("Robot state contains NaN or infinite values.")
+    return [image_candidates[top_idx][1], image_candidates[wrist_idx][1]], state
+
+
 def bgr_to_rgb(image: np.ndarray) -> np.ndarray:
     if image.ndim == 2:
         return cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
@@ -1029,7 +1235,14 @@ def run_policy_phase(
             top_image_bgr = cv2.cvtColor(top_image, cv2.COLOR_RGB2BGR)
             video_writer.write(top_image_bgr)
 
-        if policy_type == "act":
+        if policy_type == "molmoact2":
+            images, state = extract_molmoact2_inputs(obs, action_names)
+            action_vec = policy.predict_action(images=images, task=task, state=state)
+            robot_action = {name: float(action_vec[idx]) for idx, name in enumerate(action_names)}
+            actions_list.append(action_vec.copy())
+            if policy.dry_run:
+                print(f"[MOLMOACT2 DRY RUN] state={state.tolist()} action={action_vec.tolist()}")
+        elif policy_type == "act":
             observation_frame = build_dataset_frame(
                 ds_features=ds_features,
                 values=obs,
@@ -1068,7 +1281,8 @@ def run_policy_phase(
             else:
                 actions_list.append(np.asarray(action).squeeze())
 
-        robot.send_action(robot_action)
+        if not (policy_type == "molmoact2" and policy.dry_run):
+            robot.send_action(robot_action)
 
         elapsed = time.time() - t0
         if elapsed < dt:
@@ -1227,7 +1441,7 @@ def run_final_teleop_buffer_phase(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Unified SO101 evaluator for ACT/SmolVLA/Pi0/Pi0.5/Pi0-fast/DiT with teleop-first handoff, "
+            "Unified SO101 evaluator for ACT/SmolVLA/Pi0/Pi0.5/Pi0-fast/DiT/X-VLA/MolmoAct2 with teleop-first handoff, "
             "top-camera zoom, OpenCV overlay visualization, and per-episode video recording."
         )
     )
@@ -1242,7 +1456,7 @@ def main():
     parser.add_argument(
         "--policy-family",
         type=str,
-        choices=["act", "smolvla", "pi0", "pi05", "pi0.5", "pi0-fast", "pi0_fast", "pi0fast", "dit", "xvla", "x-vla", "x_vla"],
+        choices=["act", "smolvla", "pi0", "pi05", "pi0.5", "pi0-fast", "pi0_fast", "pi0fast", "dit", "xvla", "x-vla", "x_vla", "molmoact2"],
         default=None,
         help="Alias for --policy-type.",
     )
@@ -1262,6 +1476,45 @@ def main():
         type=str,
         default=None,
         help="Optional Hugging Face revision/branch/tag/commit.",
+    )
+    parser.add_argument(
+        "--molmoact2-dtype",
+        choices=["bfloat16", "float32"],
+        default="bfloat16",
+        help="MolmoAct2 model dtype. bfloat16 is recommended for 24 GB GPUs.",
+    )
+    parser.add_argument(
+        "--molmoact2-norm-tag",
+        default="so100_so101_molmoact2",
+        help="Normalization tag stored in the MolmoAct2 checkpoint.",
+    )
+    parser.add_argument(
+        "--molmoact2-num-steps",
+        type=int,
+        default=10,
+        help="Number of continuous flow-solver steps.",
+    )
+    parser.add_argument(
+        "--molmoact2-actions-per-chunk",
+        type=int,
+        default=10,
+        help="Maximum predicted actions to execute before requesting a new chunk.",
+    )
+    parser.add_argument(
+        "--molmoact2-enable-cuda-graph",
+        action="store_true",
+        help="Enable CUDA graph capture after initial testing (disabled by default).",
+    )
+    parser.add_argument(
+        "--molmoact2-max-joint-step-deg",
+        type=float,
+        default=15.0,
+        help="Clamp each absolute joint command relative to current state; 0 disables clamping.",
+    )
+    parser.add_argument(
+        "--molmoact2-dry-run",
+        action="store_true",
+        help="Run inference and record/print actions without sending commands to the robot.",
     )
 
     parser.add_argument(
@@ -1508,6 +1761,13 @@ def main():
     if args.final_teleop_buffer_seconds < 0.0:
         raise ValueError("--final-teleop-buffer-seconds must be >= 0.0")
 
+    if args.molmoact2_num_steps <= 0:
+        raise ValueError("--molmoact2-num-steps must be > 0")
+    if args.molmoact2_actions_per_chunk <= 0:
+        raise ValueError("--molmoact2-actions-per-chunk must be > 0")
+    if args.molmoact2_max_joint_step_deg < 0.0:
+        raise ValueError("--molmoact2-max-joint-step-deg must be >= 0")
+
     registry_entry = POLICY_REGISTRY[args.policy_type]
     policy_path = args.policy_path or registry_entry["default_path"]
     robot_type = args.robot_type or registry_entry["default_robot_type"]
@@ -1515,13 +1775,27 @@ def main():
     device_str = "cuda" if torch.cuda.is_available() else "cpu"
     device = get_safe_torch_device(device_str, log=True)
 
-    policy = load_policy(
-        policy_type=args.policy_type,
-        policy_path=policy_path,
-        device=str(device),
-        policy_from_hub=args.policy_from_hub,
-        revision=args.policy_revision,
-    )
+    if args.policy_type == "molmoact2":
+        policy = load_molmoact2_policy(
+            policy_path=policy_path,
+            device=device,
+            revision=args.policy_revision,
+            dtype_name=args.molmoact2_dtype,
+            norm_tag=args.molmoact2_norm_tag,
+            num_steps=args.molmoact2_num_steps,
+            actions_per_chunk=args.molmoact2_actions_per_chunk,
+            enable_cuda_graph=args.molmoact2_enable_cuda_graph,
+            max_joint_step_deg=args.molmoact2_max_joint_step_deg,
+            dry_run=args.molmoact2_dry_run,
+        )
+    else:
+        policy = load_policy(
+            policy_type=args.policy_type,
+            policy_path=policy_path,
+            device=str(device),
+            policy_from_hub=args.policy_from_hub,
+            revision=args.policy_revision,
+        )
 
     # For pi0_fast, use optimized GPU-accelerated action tokenizer processor
     _preprocessor_overrides = {"device_processor": {"device": str(device)}}
@@ -1555,13 +1829,16 @@ def main():
         except Exception as _err:
             print(f"[WARN] Could not load optimized action tokenizer for pi0_fast: {_err}. Falling back to default.")
 
-    preprocess, postprocess = make_pre_post_processors(
-        policy.config,
-        policy_path,
-        preprocessor_config_filename="policy_preprocessor.json",
-        postprocessor_config_filename="policy_postprocessor.json",
-        preprocessor_overrides=_preprocessor_overrides,
-    )
+    if args.policy_type == "molmoact2":
+        preprocess, postprocess = None, None
+    else:
+        preprocess, postprocess = make_pre_post_processors(
+            policy.config,
+            policy_path,
+            preprocessor_config_filename="policy_preprocessor.json",
+            postprocessor_config_filename="policy_postprocessor.json",
+            preprocessor_overrides=_preprocessor_overrides,
+        )
 
     # Load optional global per-iteration task variants (only used when not running all tasks)
     task_variants: list[str] | None = None
