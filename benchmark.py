@@ -535,6 +535,50 @@ class MultiRobot:
         return self.primary.get_observation()
 
 
+class FakeRobot:
+    """Minimal fake robot wrapper that avoids hardware access for dry-run/testing.
+
+    It mirrors the small subset of the SO101Follower API used by the evaluator:
+    `connect()`, `disconnect()`, `send_action()`, `get_observation()`, and
+    `action_features` / `observation_features` attributes.
+    """
+
+    def __init__(self, real_robot: Any, top_shape: tuple[int, int], wrist_shape: tuple[int, int], action_names: list[str]):
+        self._real = real_robot
+        # Preserve feature metadata so downstream code can build dataset frames
+        self.action_features = getattr(real_robot, "action_features", {})
+        self.observation_features = getattr(real_robot, "observation_features", {})
+        self.id = getattr(real_robot, "id", "fake_robot")
+        self._top_h, self._top_w = top_shape
+        self._wrist_h, self._wrist_w = wrist_shape
+        self._action_names = list(action_names) if action_names is not None else []
+
+    def connect(self):
+        print(f"[FAKE] Skipping hardware connect for {self.id}")
+
+    def disconnect(self):
+        print(f"[FAKE] Skipping hardware disconnect for {self.id}")
+
+    def send_action(self, action):
+        # No-op: intentionally do not forward commands to hardware
+        return None
+
+    def get_observation(self):
+        # Return synthetic top/wrist RGB images and a zero robot state vector.
+        top = np.full((self._top_h, self._top_w, 3), 128, dtype=np.uint8)
+        wrist = np.full((self._wrist_h, self._wrist_w, 3), 128, dtype=np.uint8)
+        # Provide state vector fallback under 'state' key if action names are known
+        state = np.zeros(len(self._action_names), dtype=np.float32)
+        return {
+            "observation": {
+                "top_camera": top,
+                "wrist_camera": wrist,
+                "state": state,
+            },
+            "state": state,
+        }
+
+
 def hw_to_dataset_features_compat(hw_feats, prefix: str):
     try:
         return hw_to_dataset_features(hw_feats, prefix, use_video=True)
@@ -1049,9 +1093,29 @@ def load_reference_pose_image(
         return None, None
 
     pose_path = Path(reference_pose_dir) / f"pic{iteration_idx}.jpg"
+
+    # Fallbacks: accept common filenames (top.jpg, wrist.jpg, reference.jpg) or any image file in the folder
     if not pose_path.exists():
-        print(f"[WARN] Reference pose image missing for iteration {iteration_idx}: {pose_path}")
-        return None, pose_path
+        ref_dir = Path(reference_pose_dir)
+        candidates = []
+        for name in (f"pic{iteration_idx}.jpg", "top.jpg", "wrist.jpg", "reference.jpg", "ref.jpg"):
+            p = ref_dir / name
+            if p.exists():
+                candidates.append(p)
+        if not candidates:
+            # pick first image file in the directory
+            for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp"):
+                files = sorted(ref_dir.glob(ext))
+                if files:
+                    candidates.extend(files)
+                    break
+
+        if not candidates:
+            print(f"[WARN] Reference pose image missing for iteration {iteration_idx}: {pose_path}")
+            return None, pose_path
+
+        pose_path = candidates[0]
+        print(f"[INFO] Using reference pose image: {pose_path}")
 
     image = cv2.imread(str(pose_path))
     if image is None:
@@ -1681,6 +1745,13 @@ def main():
     parser.add_argument("--wrist-fps", type=int, default=30)
 
     parser.add_argument(
+        "--no-hardware",
+        dest="no_hardware",
+        action="store_true",
+        help="Do not connect to robot hardware or cameras; use synthetic observations (safe dry-run).",
+    )
+
+    parser.add_argument(
         "--output-video-dir",
         type=str,
         default="policy_eval_videos", # default output directory
@@ -1991,16 +2062,34 @@ def main():
             if args.primary_follower_index < 0 or args.primary_follower_index >= len(robots):
                 raise ValueError("--primary-follower-index is out of range for provided arms")
 
-            multi_robot = MultiRobot(robots, primary_idx=args.primary_follower_index)
-
-            print("[INIT] Connecting followers...")
-            multi_robot.connect()
-
-            primary_robot = robots[args.primary_follower_index]
-            action_features = hw_to_dataset_features_compat(primary_robot.action_features, "action")
-            obs_features = hw_to_dataset_features_compat(primary_robot.observation_features, "observation")
+            # Determine dataset feature metadata from the primary robot before touching hardware
+            primary_candidate = robots[args.primary_follower_index]
+            primary_raw = getattr(primary_candidate, "robot", primary_candidate)
+            action_features = hw_to_dataset_features_compat(primary_raw.action_features, "action")
+            obs_features = hw_to_dataset_features_compat(primary_raw.observation_features, "observation")
             ds_features = {**obs_features, **action_features}
             action_names = ds_features[ACTION]["names"]
+
+            # If requested, substitute fake robots that do not open cameras or serial ports
+            if args.no_hardware:
+                print("[INIT] No-hardware mode: using synthetic fake robots (no device access)")
+                fake_robots: list[Any] = []
+                for r in robots:
+                    raw = getattr(r, "robot", r)
+                    fake = FakeRobot(
+                        real_robot=raw,
+                        top_shape=(args.top_height, args.top_width),
+                        wrist_shape=(args.wrist_height, args.wrist_width),
+                        action_names=action_names,
+                    )
+                    fake_robots.append(fake)
+                robots = fake_robots
+
+            multi_robot = MultiRobot(robots, primary_idx=args.primary_follower_index)
+
+            if not args.no_hardware:
+                print("[INIT] Connecting followers...")
+                multi_robot.connect()
             reset_robot_action: dict[str, float] | None = None
             if args.reset_mode == "fixed":
                 if not args.reset_action_file:
