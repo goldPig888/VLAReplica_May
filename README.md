@@ -229,9 +229,9 @@ python benchmark.py \
   --molmoact2-dry-run
 ```
 
-Replace the serial port and camera indexes with the values reported on your machine. After reviewing the saved actions, remove `--molmoact2-dry-run` to allow policy control. The default safety clamp limits each commanded joint change to 15 degrees relative to the current state; override it with `--molmoact2-max-joint-step-deg`, or set it to `0` only after validating the setup.
+Replace the serial port and camera indexes with the values reported on your machine. The released checkpoint uses the old LeRobot v2.1 SO-100 degree convention. For MolmoAct2, the evaluator configures LeRobot's follower in degree mode and converts to and from current SO-101 v3 coordinates using the official defaults `--molmoact2-joint-signs 1,-1,1,1,1,1` and `--molmoact2-joint-offsets 0,90,90,0,0,0`. MolmoAct2 remains in dry-run mode by default even if `--molmoact2-dry-run` is omitted. After checking the recorded actions, pass `--molmoact2-enable-hardware-actions` to allow policy control. The conservative defaults execute one predicted action per inference and limit each commanded joint change to 3 degrees relative to the current state in both the adapter and robot driver. Increase these limits only after validating the setup; a per-step clamp limits speed but cannot prevent a series of commands from reaching the table.
 
-MolmoAct2-specific options include `--molmoact2-dtype`, `--molmoact2-norm-tag`, `--molmoact2-num-steps`, `--molmoact2-actions-per-chunk`, `--molmoact2-enable-cuda-graph`, `--molmoact2-max-joint-step-deg`, and `--molmoact2-dry-run`.
+MolmoAct2-specific options include `--molmoact2-dtype`, `--molmoact2-norm-tag`, `--molmoact2-num-steps`, `--molmoact2-actions-per-chunk`, `--molmoact2-enable-cuda-graph`, `--molmoact2-max-joint-step-deg`, `--molmoact2-joint-signs`, `--molmoact2-joint-offsets`, `--molmoact2-dry-run`, and `--molmoact2-enable-hardware-actions`.
 
 ## Evaluation process
 
