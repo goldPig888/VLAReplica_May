@@ -235,6 +235,8 @@ class MolmoAct2PolicyAdapter:
         enable_cuda_graph: bool,
         max_joint_step_deg: float,
         dry_run: bool,
+        joint_signs: np.ndarray,
+        joint_offsets: np.ndarray,
     ):
         self.model = model
         self.processor = processor
@@ -246,12 +248,23 @@ class MolmoAct2PolicyAdapter:
         self.enable_cuda_graph = enable_cuda_graph
         self.max_joint_step_deg = max_joint_step_deg
         self.dry_run = dry_run
-        self._action_queue: deque[np.ndarray] = deque()
+        self.joint_signs = np.asarray(joint_signs, dtype=np.float32)
+        self.joint_offsets = np.asarray(joint_offsets, dtype=np.float32)
+        self._action_queue: deque[tuple[np.ndarray, np.ndarray]] = deque()
+        self.last_debug: dict[str, Any] = {}
 
     def reset(self) -> None:
         self._action_queue.clear()
+        self.last_debug = {}
 
     def _predict_chunk(self, images: list[np.ndarray], task: str, state: np.ndarray) -> None:
+        if state.shape != self.joint_signs.shape or state.shape != self.joint_offsets.shape:
+            raise ValueError(
+                f"MolmoAct2 joint transform has shape {self.joint_signs.shape}, but state has shape {state.shape}."
+            )
+        # The released checkpoint uses LeRobot v2.1 (old SO-100 degree) joint
+        # coordinates, while current SO-101 hardware reports v3 coordinates.
+        model_state = self.joint_signs * state + self.joint_offsets
         autocast_enabled = self.device.type == "cuda" and self.dtype == torch.bfloat16
         with torch.inference_mode(), torch.autocast(
             device_type=self.device.type,
@@ -262,7 +275,7 @@ class MolmoAct2PolicyAdapter:
                 processor=self.processor,
                 images=images,
                 task=task,
-                state=state,
+                state=model_state,
                 norm_tag=self.norm_tag,
                 inference_action_mode="continuous",
                 enable_depth_reasoning=False,
@@ -287,7 +300,12 @@ class MolmoAct2PolicyAdapter:
             raise ValueError("MolmoAct2 returned NaN or infinite action values.")
 
         count = min(self.actions_per_chunk, actions.shape[0])
-        self._action_queue.extend(actions[:count])
+        self._action_queue.extend((action, model_state.copy()) for action in actions[:count])
+        self.last_debug = {
+            "new_chunk": True,
+            "predicted_chunk": actions.copy(),
+            "executed_chunk_size": count,
+        }
 
     def predict_action(
         self,
@@ -295,13 +313,31 @@ class MolmoAct2PolicyAdapter:
         task: str,
         state: np.ndarray,
     ) -> np.ndarray:
-        if not self._action_queue:
+        requested_new_chunk = not self._action_queue
+        if requested_new_chunk:
             self._predict_chunk(images=images, task=task, state=state)
 
-        action = self._action_queue.popleft().copy()
+        model_action, model_state = self._action_queue.popleft()
+        model_action = model_action.copy()
+        # Inverse of model_state = signs * arm_state + offsets. Signs are +/-1.
+        arm_target_unclamped = self.joint_signs * (model_action - self.joint_offsets)
+        action = arm_target_unclamped.copy()
         if self.max_joint_step_deg > 0:
             max_step = float(self.max_joint_step_deg)
             action = np.clip(action, state - max_step, state + max_step)
+        chunk_debug = self.last_debug if requested_new_chunk else {}
+        self.last_debug = {
+            **chunk_debug,
+            "new_chunk": requested_new_chunk,
+            "arm_state": state.copy(),
+            "model_state": model_state,
+            "model_action": model_action,
+            "arm_target_unclamped": arm_target_unclamped,
+            "arm_action": action.copy(),
+            "arm_delta": action - state,
+            "clipped": ~np.isclose(action, arm_target_unclamped),
+            "queued_actions_remaining": len(self._action_queue),
+        }
         return action.astype(np.float32, copy=False)
 
 
@@ -316,6 +352,8 @@ def load_molmoact2_policy(
     enable_cuda_graph: bool,
     max_joint_step_deg: float,
     dry_run: bool,
+    joint_signs: np.ndarray,
+    joint_offsets: np.ndarray,
 ) -> MolmoAct2PolicyAdapter:
     from transformers import AutoModelForImageTextToText, AutoProcessor
 
@@ -346,7 +384,23 @@ def load_molmoact2_policy(
         enable_cuda_graph=enable_cuda_graph,
         max_joint_step_deg=max_joint_step_deg,
         dry_run=dry_run,
+        joint_signs=joint_signs,
+        joint_offsets=joint_offsets,
     )
+
+
+def parse_molmoact2_joint_transform(value: str, flag_name: str) -> np.ndarray:
+    """Parse a six-value SO-100/SO-101 joint-frame transform option."""
+    parts = [part.strip() for part in value.split(",")]
+    if len(parts) != 6:
+        raise ValueError(f"{flag_name} must contain exactly 6 comma-separated values; got {len(parts)}.")
+    try:
+        result = np.asarray([float(part) for part in parts], dtype=np.float32)
+    except ValueError as exc:
+        raise ValueError(f"{flag_name} contains a non-numeric value: {value!r}") from exc
+    if not np.isfinite(result).all():
+        raise ValueError(f"{flag_name} values must all be finite.")
+    return result
 
 
 def can_open_cv_preview_window() -> bool:
@@ -1227,6 +1281,50 @@ def _make_run_timestamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def print_molmoact2_dry_run_debug(
+    policy: MolmoAct2PolicyAdapter,
+    action_names: list[str],
+    task: str,
+    images: list[np.ndarray],
+) -> None:
+    """Print the complete model-frame -> arm-frame action conversion."""
+    debug = policy.last_debug
+    print("\n[MOLMOACT2 DRY RUN]")
+    print(f"  task: {task!r}")
+    print(f"  images: {[tuple(image.shape) for image in images]}")
+    print(f"  norm_tag: {policy.norm_tag}")
+    print("  transform: model = signs * arm + offsets")
+    print(f"  signs:   {policy.joint_signs.tolist()}")
+    print(f"  offsets: {policy.joint_offsets.tolist()}")
+    print(
+        "  {:<24} {:>10} {:>11} {:>12} {:>14} {:>10} {:>9}".format(
+            "joint", "arm_state", "model_state", "model_out", "arm_unclamped", "arm_cmd", "delta"
+        )
+    )
+    for idx, name in enumerate(action_names):
+        clipped = " CLIPPED" if bool(debug["clipped"][idx]) else ""
+        print(
+            f"  {name:<24} {debug['arm_state'][idx]:>10.3f} {debug['model_state'][idx]:>11.3f} "
+            f"{debug['model_action'][idx]:>12.3f} {debug['arm_target_unclamped'][idx]:>14.3f} "
+            f"{debug['arm_action'][idx]:>10.3f} {debug['arm_delta'][idx]:>9.3f}{clipped}"
+        )
+    print(
+        f"  max_step_deg: {policy.max_joint_step_deg:g}; "
+        f"queued_actions_remaining: {debug['queued_actions_remaining']}"
+    )
+    if debug.get("new_chunk"):
+        chunk = debug["predicted_chunk"]
+        print(
+            f"  full model-output chunk: shape={tuple(chunk.shape)}, "
+            f"executing_first={debug['executed_chunk_size']}"
+        )
+        for step, model_action in enumerate(chunk):
+            values = ", ".join(
+                f"{name}={float(model_action[idx]):.3f}" for idx, name in enumerate(action_names)
+            )
+            print(f"    [{step:02d}] {values}")
+
+
 def run_policy_phase(
     robot,
     policy,
@@ -1305,7 +1403,7 @@ def run_policy_phase(
             robot_action = {name: float(action_vec[idx]) for idx, name in enumerate(action_names)}
             actions_list.append(action_vec.copy())
             if policy.dry_run:
-                print(f"[MOLMOACT2 DRY RUN] state={state.tolist()} action={action_vec.tolist()}")
+                print_molmoact2_dry_run_debug(policy, action_names, task, images)
         elif policy_type == "act":
             observation_frame = build_dataset_frame(
                 ds_features=ds_features,
@@ -1561,8 +1659,8 @@ def main():
     parser.add_argument(
         "--molmoact2-actions-per-chunk",
         type=int,
-        default=10,
-        help="Maximum predicted actions to execute before requesting a new chunk.",
+        default=1,
+        help="Maximum predicted actions to execute before requesting a new chunk (default: 1 for safety).",
     )
     parser.add_argument(
         "--molmoact2-enable-cuda-graph",
@@ -1572,13 +1670,40 @@ def main():
     parser.add_argument(
         "--molmoact2-max-joint-step-deg",
         type=float,
-        default=15.0,
+        default=3.0,
         help="Clamp each absolute joint command relative to current state; 0 disables clamping.",
     )
     parser.add_argument(
         "--molmoact2-dry-run",
+        dest="molmoact2_dry_run",
         action="store_true",
-        help="Run inference and record/print actions without sending commands to the robot.",
+        default=True,
+        help="Run inference and record/print actions without sending commands to the robot (default).",
+    )
+    parser.add_argument(
+        "--molmoact2-enable-hardware-actions",
+        dest="molmoact2_dry_run",
+        action="store_false",
+        help=(
+            "DANGEROUS: allow MolmoAct2 to command the follower. Use only after checking calibration "
+            "and validating recorded dry-run state/action units and joint order."
+        ),
+    )
+    parser.add_argument(
+        "--molmoact2-joint-offsets",
+        default="0,90,90,0,0,0",
+        help=(
+            "Offsets for SO-101 v3 arm coordinates -> checkpoint v2.1 coordinates "
+            "(default: 0,90,90,0,0,0)."
+        ),
+    )
+    parser.add_argument(
+        "--molmoact2-joint-signs",
+        default="1,-1,1,1,1,1",
+        help=(
+            "Signs for SO-101 v3 arm coordinates -> checkpoint v2.1 coordinates "
+            "(default: 1,-1,1,1,1,1)."
+        ),
     )
 
     parser.add_argument(
@@ -1838,6 +1963,14 @@ def main():
         raise ValueError("--molmoact2-actions-per-chunk must be > 0")
     if args.molmoact2_max_joint_step_deg < 0.0:
         raise ValueError("--molmoact2-max-joint-step-deg must be >= 0")
+    molmoact2_joint_offsets = parse_molmoact2_joint_transform(
+        args.molmoact2_joint_offsets, "--molmoact2-joint-offsets"
+    )
+    molmoact2_joint_signs = parse_molmoact2_joint_transform(
+        args.molmoact2_joint_signs, "--molmoact2-joint-signs"
+    )
+    if not np.isin(molmoact2_joint_signs, (-1.0, 1.0)).all():
+        raise ValueError("--molmoact2-joint-signs values must each be -1 or 1")
 
     registry_entry = POLICY_REGISTRY[args.policy_type]
     policy_path = args.policy_path or registry_entry["default_path"]
@@ -1847,6 +1980,16 @@ def main():
     device = get_safe_torch_device(device_str, log=True)
 
     if args.policy_type == "molmoact2":
+        if args.molmoact2_dry_run:
+            print(
+                "[SAFETY] MolmoAct2 is in dry-run mode; policy actions will NOT be sent to the follower. "
+                "Live policy motion requires --molmoact2-enable-hardware-actions."
+            )
+        else:
+            print(
+                "[SAFETY WARNING] MolmoAct2 hardware actions are ENABLED. Keep an emergency stop ready "
+                "and verify that robot state/action units match the checkpoint's raw robot scale."
+            )
         policy = load_molmoact2_policy(
             policy_path=policy_path,
             device=device,
@@ -1858,6 +2001,8 @@ def main():
             enable_cuda_graph=args.molmoact2_enable_cuda_graph,
             max_joint_step_deg=args.molmoact2_max_joint_step_deg,
             dry_run=args.molmoact2_dry_run,
+            joint_signs=molmoact2_joint_signs,
+            joint_offsets=molmoact2_joint_offsets,
         )
     else:
         policy = load_policy(
@@ -2055,6 +2200,15 @@ def main():
                     id=follower_id,
                     cameras=_build_camera_cfg(top_index, wrist_index) if is_primary else {},
                     calibration_dir=Path(calib_dir_str),
+                    # MolmoAct2 was trained in degrees. LeRobot 0.5.1 otherwise
+                    # exposes v3 normalized joint ranges (-100..100 / 0..100),
+                    # which must never be sent directly to this checkpoint.
+                    use_degrees=args.policy_type == "molmoact2",
+                    max_relative_target=(
+                        args.molmoact2_max_joint_step_deg
+                        if args.policy_type == "molmoact2" and args.molmoact2_max_joint_step_deg > 0
+                        else None
+                    ),
                 )
                 raw_robot = SO101Follower(follower_cfg)
                 robots.append(ZoomRobot(raw_robot, zoom_factor=args.zoom))
