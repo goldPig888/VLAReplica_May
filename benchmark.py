@@ -250,10 +250,12 @@ class MolmoAct2PolicyAdapter:
         self.dry_run = dry_run
         self.joint_signs = np.asarray(joint_signs, dtype=np.float32)
         self.joint_offsets = np.asarray(joint_offsets, dtype=np.float32)
-        self._action_queue: deque[np.ndarray] = deque()
+        self._action_queue: deque[tuple[np.ndarray, np.ndarray]] = deque()
+        self.last_debug: dict[str, Any] = {}
 
     def reset(self) -> None:
         self._action_queue.clear()
+        self.last_debug = {}
 
     def _predict_chunk(self, images: list[np.ndarray], task: str, state: np.ndarray) -> None:
         if state.shape != self.joint_signs.shape or state.shape != self.joint_offsets.shape:
@@ -298,7 +300,12 @@ class MolmoAct2PolicyAdapter:
             raise ValueError("MolmoAct2 returned NaN or infinite action values.")
 
         count = min(self.actions_per_chunk, actions.shape[0])
-        self._action_queue.extend(actions[:count])
+        self._action_queue.extend((action, model_state.copy()) for action in actions[:count])
+        self.last_debug = {
+            "new_chunk": True,
+            "predicted_chunk": actions.copy(),
+            "executed_chunk_size": count,
+        }
 
     def predict_action(
         self,
@@ -306,15 +313,31 @@ class MolmoAct2PolicyAdapter:
         task: str,
         state: np.ndarray,
     ) -> np.ndarray:
-        if not self._action_queue:
+        requested_new_chunk = not self._action_queue
+        if requested_new_chunk:
             self._predict_chunk(images=images, task=task, state=state)
 
-        action = self._action_queue.popleft().copy()
+        model_action, model_state = self._action_queue.popleft()
+        model_action = model_action.copy()
         # Inverse of model_state = signs * arm_state + offsets. Signs are +/-1.
-        action = self.joint_signs * (action - self.joint_offsets)
+        arm_target_unclamped = self.joint_signs * (model_action - self.joint_offsets)
+        action = arm_target_unclamped.copy()
         if self.max_joint_step_deg > 0:
             max_step = float(self.max_joint_step_deg)
             action = np.clip(action, state - max_step, state + max_step)
+        chunk_debug = self.last_debug if requested_new_chunk else {}
+        self.last_debug = {
+            **chunk_debug,
+            "new_chunk": requested_new_chunk,
+            "arm_state": state.copy(),
+            "model_state": model_state,
+            "model_action": model_action,
+            "arm_target_unclamped": arm_target_unclamped,
+            "arm_action": action.copy(),
+            "arm_delta": action - state,
+            "clipped": ~np.isclose(action, arm_target_unclamped),
+            "queued_actions_remaining": len(self._action_queue),
+        }
         return action.astype(np.float32, copy=False)
 
 
@@ -1258,6 +1281,50 @@ def _make_run_timestamp() -> str:
     return time.strftime("%Y%m%d_%H%M%S")
 
 
+def print_molmoact2_dry_run_debug(
+    policy: MolmoAct2PolicyAdapter,
+    action_names: list[str],
+    task: str,
+    images: list[np.ndarray],
+) -> None:
+    """Print the complete model-frame -> arm-frame action conversion."""
+    debug = policy.last_debug
+    print("\n[MOLMOACT2 DRY RUN]")
+    print(f"  task: {task!r}")
+    print(f"  images: {[tuple(image.shape) for image in images]}")
+    print(f"  norm_tag: {policy.norm_tag}")
+    print("  transform: model = signs * arm + offsets")
+    print(f"  signs:   {policy.joint_signs.tolist()}")
+    print(f"  offsets: {policy.joint_offsets.tolist()}")
+    print(
+        "  {:<24} {:>10} {:>11} {:>12} {:>14} {:>10} {:>9}".format(
+            "joint", "arm_state", "model_state", "model_out", "arm_unclamped", "arm_cmd", "delta"
+        )
+    )
+    for idx, name in enumerate(action_names):
+        clipped = " CLIPPED" if bool(debug["clipped"][idx]) else ""
+        print(
+            f"  {name:<24} {debug['arm_state'][idx]:>10.3f} {debug['model_state'][idx]:>11.3f} "
+            f"{debug['model_action'][idx]:>12.3f} {debug['arm_target_unclamped'][idx]:>14.3f} "
+            f"{debug['arm_action'][idx]:>10.3f} {debug['arm_delta'][idx]:>9.3f}{clipped}"
+        )
+    print(
+        f"  max_step_deg: {policy.max_joint_step_deg:g}; "
+        f"queued_actions_remaining: {debug['queued_actions_remaining']}"
+    )
+    if debug.get("new_chunk"):
+        chunk = debug["predicted_chunk"]
+        print(
+            f"  full model-output chunk: shape={tuple(chunk.shape)}, "
+            f"executing_first={debug['executed_chunk_size']}"
+        )
+        for step, model_action in enumerate(chunk):
+            values = ", ".join(
+                f"{name}={float(model_action[idx]):.3f}" for idx, name in enumerate(action_names)
+            )
+            print(f"    [{step:02d}] {values}")
+
+
 def run_policy_phase(
     robot,
     policy,
@@ -1336,7 +1403,7 @@ def run_policy_phase(
             robot_action = {name: float(action_vec[idx]) for idx, name in enumerate(action_names)}
             actions_list.append(action_vec.copy())
             if policy.dry_run:
-                print(f"[MOLMOACT2 DRY RUN] state={state.tolist()} action={action_vec.tolist()}")
+                print_molmoact2_dry_run_debug(policy, action_names, task, images)
         elif policy_type == "act":
             observation_frame = build_dataset_frame(
                 ds_features=ds_features,
