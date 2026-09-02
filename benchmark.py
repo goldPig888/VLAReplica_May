@@ -1482,7 +1482,11 @@ def run_teleop_setup_phase(
     reset_robot_action: dict[str, float] | None,
 ) -> bool:
     """Teleop phase before each policy run. Returns True to start policy, False to quit."""
-    mode_label = "leader controls follower" if reset_mode == "leader" else "fixed reset action"
+    mode_label = {
+        "leader": "leader controls follower",
+        "fixed": "fixed reset action",
+        "none": "manual reset (no leader or reset commands)",
+    }[reset_mode]
     print(
         f"[TELEOP] Iteration {iteration_idx}/{total_iterations}: {mode_label}. "
         "Press ENTER to start policy, q to quit."
@@ -1518,7 +1522,7 @@ def run_teleop_setup_phase(
             if reset_mode == "fixed":
                 if reset_robot_action is not None:
                     robot.send_action(reset_robot_action)
-            else:
+            elif reset_mode == "leader":
                 if teleop is None:
                     raise RuntimeError("Teleop leader is not initialized but reset_mode=leader")
                 action = teleop.get_action()
@@ -1799,9 +1803,9 @@ def main():
     parser.add_argument(
         "--reset-mode",
         type=str,
-        choices=["leader", "fixed"],
+        choices=["leader", "fixed", "none"],
         default="leader",
-        help="Reset control mode: leader arm or fixed normalized action vector.",
+        help="Reset control mode: leader arm, fixed normalized action vector, or manual (none).",
     )
     parser.add_argument(
         "--reset-action-file",
@@ -2161,7 +2165,7 @@ def main():
         print("[INIT] Connecting leader...")
         teleop.connect()
     else:
-        print("[INIT] Leader teleop disabled (reset mode: fixed).")
+        print(f"[INIT] Leader teleop disabled (reset mode: {args.reset_mode}).")
 
     print(f"[INIT] Policy type : {args.policy_type}")
     print(f"[INIT] Policy path : {policy_path}")
