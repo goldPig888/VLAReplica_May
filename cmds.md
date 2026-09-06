@@ -164,13 +164,13 @@ resumes from the newest `stepX` checkpoint:
 ```bash
 cd ~/VLAReplica/molmoact2/experiments
 WANDB_PROJECT=molmoact2-vlareplica WANDB_ENTITY=local WANDB_MODE=offline \
-LEROBOT_VIDEO_BACKEND=torchcodec \
+LEROBOT_VIDEO_BACKEND=pyav \
 CUDA_VISIBLE_DEVICES=0,1,2,3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=4 \
   launch_scripts/train_lerobot.py \
   allenai/MolmoAct2-SO100_101 \
   vlareplica \
-  --frame_loading_backend=torchcodec_exact \
+  --frame_loading_backend=av \
   --max_duration=40000 \
   --device_batch_size=2 \
   --global_batch_size=16 \
