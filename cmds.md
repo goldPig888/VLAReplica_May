@@ -112,47 +112,48 @@ python benchmark.py \
 
 ## MolmoAct2 VLAReplica benchmark-aligned 40K run (effective batch 16)
 
-This uses the complete `HenryZhang/VLAReplica_SFT_data` dataset, a 32-action
-chunk, 40,000 optimizer steps, and action-expert-only fine-tuning from the
-SO100/SO101 checkpoint. With two GPUs and device batch 1, global batch 16 uses
-gradient accumulation.
+This uses all 501 recorded episodes from `HenryZhang/VLAReplica_SFT_data` (the
+paper reports this as approximately 500 demos), a 32-action chunk, 40,000
+optimizer steps, and action-expert-only fine-tuning from the SO100/SO101
+checkpoint. The action expert uses MolmoAct2's default learning rate (`1e-4`).
 
 ### Start training
 
 ```bash
-cd ~/Desktop/Github/VLAReplica/molmoact2/experiments
+cd ~/VLAReplica/molmoact2/experiments
 
-GPU_IDS=0,1 \
-NPROC_PER_NODE=2 \
-DEVICE_BATCH_SIZE=1 \
+VLA_STORAGE=/data3/may \
+GPU_IDS=0,1,2,3 \
+NPROC_PER_NODE=4 \
+DEVICE_BATCH_SIZE=2 \
 GLOBAL_BATCH_SIZE=16 \
 bash run_vlareplica_benchmark.sh
 ```
 
-For four GPUs:
+Fallback if device batch 2 runs out of memory:
 
 ```bash
-GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 DEVICE_BATCH_SIZE=1 GLOBAL_BATCH_SIZE=16 bash run_vlareplica_benchmark.sh
+VLA_STORAGE=/data3/may GPU_IDS=0,1,2,3 NPROC_PER_NODE=4 DEVICE_BATCH_SIZE=1 GLOBAL_BATCH_SIZE=16 bash run_vlareplica_benchmark.sh
 ```
 
-If the new GPUs have enough memory for two examples each, set
-`DEVICE_BATCH_SIZE=2`. Start with 1 and increase only after a short memory test.
+Both commands keep the paper-aligned effective batch size at 16; device batch 1
+simply uses more gradient accumulation.
 
 ### Live dashboard and raw log
 
 Run the dashboard in a second terminal:
 
 ```bash
-cd ~/Desktop/Github/VLAReplica/molmoact2/experiments
+cd ~/VLAReplica/molmoact2/experiments
 python scripts/monitor_vlareplica_training.py \
-  --log /metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log \
-  --save-folder /metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16
+  --log /data3/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log \
+  --save-folder /data3/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16
 ```
 
 Or follow only the raw log:
 
 ```bash
-tail -F /metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log
+tail -F /data3/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log
 ```
 
 ### Resume after an interruption
@@ -161,19 +162,21 @@ The launcher refuses to overwrite an existing run. This underlying command
 resumes from the newest `stepX` checkpoint:
 
 ```bash
-cd ~/Desktop/Github/VLAReplica/molmoact2/experiments
-CUDA_VISIBLE_DEVICES=0,1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
-torchrun --standalone --nproc-per-node=2 \
+cd ~/VLAReplica/molmoact2/experiments
+WANDB_PROJECT=molmoact2-vlareplica WANDB_MODE=offline \
+CUDA_VISIBLE_DEVICES=0,1,2,3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+torchrun --standalone --nproc-per-node=4 \
   launch_scripts/train_lerobot.py \
   allenai/MolmoAct2-SO100_101 \
   vlareplica \
+  --frame_loading_backend=av \
   --max_duration=40000 \
-  --device_batch_size=1 \
+  --device_batch_size=2 \
   --global_batch_size=16 \
   --num_workers=4 \
   --pin_memory=true \
   --log_interval=10 \
-  --save_folder=/metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16 \
+  --save_folder=/data3/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16 \
   --save_interval=5000 \
   --save_num_checkpoints_to_keep=2 \
   --eval_interval=-1 \
@@ -183,10 +186,9 @@ torchrun --standalone --nproc-per-node=2 \
   --ft_action_expert=true \
   --ft_embedding=none \
   --lora_enable=false \
-  --action_expert_learning_rate=5e-5 \
   --save_final_optim=false \
   --save_final_unsharded_checkpoint=true 2>&1 | tee -a \
-  /metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log
+  /data3/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16.log
 ```
 
 ### Convert and push the finished model to Hugging Face
@@ -196,7 +198,7 @@ run the prepared conversion/upload script. The upload is private by default.
 
 ```bash
 hf auth login
-cd ~/Desktop/Github/VLAReplica/molmoact2/experiments
+cd ~/VLAReplica/molmoact2/experiments
 bash scripts/convert_and_push_vlareplica.sh YOUR_HF_USERNAME/MolmoAct2-VLAReplica
 ```
 
