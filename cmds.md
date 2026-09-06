@@ -163,7 +163,7 @@ resumes from the newest `stepX` checkpoint:
 
 ```bash
 cd ~/VLAReplica/molmoact2/experiments
-WANDB_PROJECT=molmoact2-vlareplica WANDB_MODE=offline \
+WANDB_PROJECT=molmoact2-vlareplica WANDB_ENTITY=local WANDB_MODE=offline \
 CUDA_VISIBLE_DEVICES=0,1,2,3 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 torchrun --standalone --nproc-per-node=4 \
   launch_scripts/train_lerobot.py \
