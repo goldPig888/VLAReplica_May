@@ -260,3 +260,16 @@ For OOD benchmark, run with these:
   --task-subset OOD \
   --output-video-dir policy_eval_videos/molmoact2_vlareplica_finetuned_OOD \
 ```
+
+## Visualize MolmoAct2 training-loss convergence
+
+This accepts either the full training log or the extracted
+`molmoact2-loss-lines.txt` file and creates a self-contained HTML report:
+
+```bash
+cd ~/Desktop/Github/VLAReplica
+python visualize_molmoact2_loss.py molmoact2-loss-lines.txt --open
+```
+
+Without `--open`, view the generated page at
+`outputs/molmoact2-loss-report.html`.
