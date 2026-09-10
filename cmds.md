@@ -214,3 +214,49 @@ Converted Hugging Face model output:
 ```text
 /metadisk/may/molmoact2-checkpoints/vlareplica-molmoact2-40k-bs16/step40000-hf
 ```
+
+#HI ALEX THIS ONE FOR RUNNING FINED TUNED MOLMOACT
+
+```bash
+conda activate /metadisk/may/conda-envs/molmoact2
+cd ~/Desktop/Github/VLAReplica
+
+CUDA_VISIBLE_DEVICES=0 python benchmark.py \
+  --policy-type molmoact2 \
+  --policy-path goldPig888/MolmoAct2-VLAReplica \
+  --policy-from-hub \
+  --run-all-tasks \
+  --task-subset ID \
+  --iterations 5 \
+  --policy-seconds 90 \
+  --fps 30 \
+  --zoom 1.0 \
+  --top-width 640 \
+  --top-height 480 \
+  --wrist-width 640 \
+  --wrist-height 480 \
+  --wrist-fps 30 \
+  --eval-follower-calib-dirs calibration/robots/so101_follower \
+  --eval-follower-ports /dev/ttyACM0 \
+  --eval-follower-ids so101_follower_arm \
+  --eval-top-indexes 6 \
+  --eval-wrist-indexes 0 \
+  --reset-mode fixed \
+  --reset-action-file arm_reset.json \
+  --output-video-dir policy_eval_videos/molmoact2_vlareplica_finetuned_ID \
+  --molmoact2-norm-tag vlareplica_so101_v3 \
+  --molmoact2-joint-signs 1,1,1,1,1,1 \
+  --molmoact2-joint-offsets 0,0,0,0,0,0 \
+  --molmoact2-num-steps 9 \
+  --molmoact2-actions-per-chunk 4 \
+  --molmoact2-max-joint-step-deg 10 \
+  --molmoact2-enable-hardware-actions \
+  --molmoact2-enable-cuda-graph
+```
+
+For OOD benchmark, run with these:
+
+```bash
+  --task-subset OOD \
+  --output-video-dir policy_eval_videos/molmoact2_vlareplica_finetuned_OOD \
+```
